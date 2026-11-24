@@ -1,0 +1,7 @@
+# Python 3.12. Install CUDA PyTorch separately if GPU acceleration is needed.
+torch>=2.6
+numpy>=1.26
+opencv-python>=4.10
+Pillow>=10
+gdown>=5
+pyrealsense2>=2.56

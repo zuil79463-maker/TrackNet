@@ -1,0 +1,10 @@
+.venv/
+.cleanup-backup/
+.backup-publish/
+**/__pycache__/
+*.py[cod]
+output/
+TrackNetV3/output/
+TrackNetV3/ckpts/
+.env
+.env.*
