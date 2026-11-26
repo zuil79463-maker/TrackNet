@@ -2,7 +2,20 @@
 
 本仓库备份 `host` 工程的源码与配置，保持 `TrackNetV3/` 子目录结构。基于 [qaz812345/TrackNetV3](https://github.com/qaz812345/TrackNetV3)，保留原项目 MIT 许可证。
 
-默认使用 RealSense D435i 的彩色流，通过 CUDA / CPU 执行羽毛球二维定位，支持轨迹预览和坐标 CSV 输出。当前仍为 FP32 推理版本；FP16、预处理缓存等性能优化尚未实施。
+默认使用 RealSense D435i 的彩色流执行羽毛球二维定位，支持轨迹预览和坐标 CSV 输出。PC 端通过 CUDA / CPU（PyTorch FP32）推理；香橙派 AIpro 端通过 ATC 转换的 OM 模型在 Ascend NPU 上推理。
+
+## 香橙派 AIpro 部署
+
+```bash
+# PC：导出 ONNX，再拷贝到板上 TrackNetV3/ckpts/
+#   .\.venv\Scripts\python.exe .\TrackNetV3\export_onnx.py
+# AIpro：
+bash TrackNetV3/setup_aipro.sh     # 依赖、RealSense、USB 权限
+bash TrackNetV3/convert_om.sh      # ONNX -> OM（ATC）
+bash TrackNetV3/run_tracking.sh --csv output/d435i.csv
+```
+
+详见 [TrackNetV3/README.md](TrackNetV3/README.md#部署到香橙派-aiproascend-310b-npu)。AIpro 适配尚未在实机验证。
 
 ## 恢复环境
 
@@ -20,7 +33,7 @@ powershell -ExecutionPolicy Bypass -File .\TrackNetV3\run_tracking.ps1
 
 ## 备份范围
 
-- `TrackNetV3/`：实时推理、RealSense 接入、模型结构、测试、依赖清单、启动脚本及许可证。
+- `TrackNetV3/`：实时推理、RealSense 接入、模型结构、NPU/ONNX 推理引擎、ONNX 导出、AIpro 部署脚本、测试、依赖清单、启动脚本及许可证。
 - `.vscode/settings.json`：当前编辑器配置。
 - 不提交可重建的 `.venv`、Python 缓存、清理恢复包、输出文件和上游 Git 元数据。
 - 官方模型权重 `TrackNet_best.pt`（约 136 MB）通过 Git LFS 备份。克隆前安装并启用 Git LFS，克隆后可运行 `git lfs pull` 恢复模型；也可使用上述官方下载脚本。模型来源与 SHA256 见子目录说明。

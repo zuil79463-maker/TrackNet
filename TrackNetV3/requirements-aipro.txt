@@ -1,0 +1,8 @@
+# Orange Pi AIpro (aarch64, Ascend 310B) runtime dependencies. PyTorch is NOT required on the board:
+# inference uses the ATC-converted OM model through pyACL, which ships with CANN (set_env.sh).
+numpy>=1.21
+opencv-python>=4.8
+Pillow>=9
+# Official wheels may be unavailable for some aarch64/Python combinations;
+# setup_aipro.sh falls back to install_librealsense.sh (source build) in that case.
+pyrealsense2>=2.54

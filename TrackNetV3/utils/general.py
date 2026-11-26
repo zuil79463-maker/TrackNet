@@ -11,10 +11,16 @@ def resize_rgb(frame):
     return np.asarray(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).resize((WIDTH, HEIGHT)))
 
 
-def prepare_input(frames, background):
+def stack_input(resized_frames, background):
+    """Build the (C, H, W) float32 network input from already resized RGB images."""
     # The deployed checkpoint expects RGB background followed by eight RGB frames.
-    images = [background] + [resize_rgb(frame) for frame in frames]
-    return np.concatenate([image.transpose(2, 0, 1) for image in images], axis=0).astype(np.float32) / 255.0
+    images = [background] + list(resized_frames)
+    return np.ascontiguousarray(
+        np.concatenate([image.transpose(2, 0, 1) for image in images], axis=0), dtype=np.float32) / np.float32(255.0)
+
+
+def prepare_input(frames, background):
+    return stack_input([resize_rgb(frame) for frame in frames], background)
 
 
 def locate(heatmap, image_shape, threshold=0.5):

@@ -1,5 +1,7 @@
-"""Regression tests with a simulated camera; no live camera is opened."""
+"""Regression tests with a simulated camera and NPU; no live camera or Ascend device is opened."""
 import csv
+import ctypes
+import importlib.util
 from pathlib import Path
 import tempfile
 import threading
@@ -11,9 +13,10 @@ from unittest.mock import MagicMock, patch
 import cv2
 import numpy as np
 
+import inference
 import predict
 import realsense_camera
-from utils.general import HEIGHT, WIDTH, locate, prepare_input
+from utils.general import HEIGHT, WIDTH, locate, prepare_input, resize_rgb, stack_input
 
 
 class FakeCapture:
@@ -113,6 +116,133 @@ class RealtimeTests(unittest.TestCase):
                 self.assertGreaterEqual(float(row['ResultAgeMs']), float(row['InferenceMs']))
                 self.assertTrue(0 <= int(row['X']) < 320)
                 self.assertTrue(0 <= int(row['Y']) < 180)
+
+
+def fake_acl(input_shape=(1, 27, HEIGHT, WIDTH)):
+    """Minimal pyACL stand-in (device run mode, shared memory) backed by ctypes buffers."""
+    memory, log = {}, []
+
+    def malloc(size, policy=0):
+        buffer = ctypes.create_string_buffer(size)
+        memory[ctypes.addressof(buffer)] = buffer
+        return ctypes.addressof(buffer), 0
+
+    def free(pointer):
+        memory.pop(pointer)
+        return 0
+
+    def memcpy(destination, destination_size, source, count, kind):
+        assert count <= destination_size
+        log.append(('memcpy', kind))
+        ctypes.memmove(destination, source, count)
+        return 0
+
+    def add_dataset_buffer(dataset, data):
+        dataset.append(data)
+        return dataset, 0
+
+    def execute(model_id, inputs, outputs):
+        (in_ptr, in_size), (out_ptr, out_size) = inputs[0], outputs[0]
+        source = np.ctypeslib.as_array((ctypes.c_float * (in_size // 4)).from_address(in_ptr))
+        target = np.ctypeslib.as_array((ctypes.c_float * (out_size // 4)).from_address(out_ptr))
+        # Echo the last input channel so the test can check the data path end to end.
+        target[:] = source.reshape(-1, HEIGHT * WIDTH)[-1]
+        return 0
+
+    size = int(np.prod(input_shape)) * 4
+    acl = SimpleNamespace(
+        init=lambda: 0, finalize=lambda: log.append(('finalize',)) or 0,
+        create_data_buffer=lambda pointer, size: (pointer, size), destroy_data_buffer=lambda data: 0,
+        rt=SimpleNamespace(set_device=lambda i: 0, reset_device=lambda i: log.append(('reset',)) or 0,
+                           create_context=lambda i: ('context', 0), destroy_context=lambda c: 0,
+                           set_context=lambda c: 0, get_run_mode=lambda: (0, 0), malloc=malloc, free=free,
+                           malloc_host=malloc, free_host=free, memcpy=memcpy),
+        mdl=SimpleNamespace(load_from_file=lambda path: (7, 0), unload=lambda m: log.append(('unload',)) or 0,
+                            create_desc=lambda: 'desc', destroy_desc=lambda d: 0, get_desc=lambda d, m: 0,
+                            get_num_inputs=lambda d: 1, get_num_outputs=lambda d: 1,
+                            get_input_dims=lambda d, i: ({'dims': list(input_shape)}, 0),
+                            get_input_size_by_index=lambda d, i: size,
+                            get_output_size_by_index=lambda d, i: HEIGHT * WIDTH * 4,
+                            create_dataset=list, destroy_dataset=lambda d: 0,
+                            add_dataset_buffer=add_dataset_buffer, execute=execute))
+    return acl, memory, log
+
+
+class EngineTests(unittest.TestCase):
+    def test_cached_resize_matches_reference_preprocessing(self):
+        rng = np.random.default_rng(1)
+        frames = [rng.integers(0, 255, (180, 320, 3), dtype=np.uint8) for _ in range(8)]
+        background = rng.integers(0, 255, (HEIGHT, WIDTH, 3), dtype=np.uint8)
+        expected = prepare_input(frames, background)
+        actual = stack_input([resize_rgb(frame) for frame in frames], background)
+        self.assertEqual(actual.dtype, np.float32)
+        self.assertTrue(actual.flags['C_CONTIGUOUS'])
+        np.testing.assert_allclose(actual, expected, atol=1e-7)
+
+    def test_engine_resolution(self):
+        self.assertEqual(inference.resolve_engine('auto', Path('a.om')), 'om')
+        self.assertEqual(inference.resolve_engine('auto', Path('a.onnx')), 'onnx')
+        self.assertEqual(inference.resolve_engine('auto', Path('a.pt')), 'torch')
+        self.assertEqual(inference.resolve_engine('onnx'), 'onnx')
+        with patch.object(inference, 'acl_available', return_value=False):
+            self.assertEqual(inference.resolve_engine('auto'), 'torch')
+        args = predict.parse_args(['--engine', 'torch'])
+        self.assertEqual(args.model, inference.DEFAULT_CHECKPOINT)
+
+    def test_acl_engine_data_path_and_release(self):
+        acl, memory, log = fake_acl()
+        with patch.object(inference, 'load_acl', return_value=acl):
+            engine = inference.AclEngine('model.om')
+            self.assertEqual(engine.seq_len, 8)
+            tensor = np.random.default_rng(2).random((27, HEIGHT, WIDTH), dtype=np.float32)
+            heatmap = engine(tensor)
+            self.assertEqual(heatmap.shape, (HEIGHT, WIDTH))
+            np.testing.assert_array_equal(heatmap, tensor[-1])
+            self.assertEqual({entry[1] for entry in log if entry[0] == 'memcpy'},
+                             {inference.ACL_MEMCPY_DEVICE_TO_DEVICE})
+            with self.assertRaises(ValueError):
+                engine(tensor[:3])
+            engine.close()
+            engine.close()
+        self.assertEqual(memory, {})
+        self.assertEqual([entry[0] for entry in log if entry[0] != 'memcpy'], ['unload', 'reset', 'finalize'])
+
+    def test_acl_engine_rejects_wrong_model_and_cleans_up(self):
+        acl, memory, log = fake_acl(input_shape=(1, 27, 288, 288))
+        with patch.object(inference, 'load_acl', return_value=acl):
+            with self.assertRaisesRegex(ValueError, 'input must be'):
+                inference.AclEngine('model.om')
+        self.assertEqual(memory, {})
+        self.assertIn(('finalize',), log)
+
+    def test_tracker_uses_cached_images(self):
+        engine = MagicMock(seq_len=8)
+        engine.name = 'fake'
+        heatmap = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
+        heatmap[100:103, 200:203] = .9
+        engine.return_value = heatmap
+        tracker = predict.Tracker(engine)
+        frame = np.zeros((576, 1024, 3), dtype=np.uint8)
+        packets = [(i, '', 0.0, frame, resize_rgb(frame)) for i in range(8)]
+        background = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+        self.assertEqual(tracker.infer(packets, background, .5)[:3], (1, 402, 202))
+        self.assertEqual(engine.call_args[0][0].shape, (27, HEIGHT, WIDTH))
+        tracker.close()
+        engine.close.assert_called_once()
+
+    @unittest.skipUnless(importlib.util.find_spec('onnx') and importlib.util.find_spec('onnxruntime'),
+                         'onnx/onnxruntime not installed')
+    def test_onnx_export_matches_pytorch(self):
+        import export_onnx
+        with tempfile.TemporaryDirectory(prefix='tracknet-onnx-') as directory:
+            path = Path(directory) / 'tracknet.onnx'
+            model, seq_len = export_onnx.export(inference.DEFAULT_CHECKPOINT, path, 11)
+            engine = inference.OnnxEngine(path)
+            self.assertEqual(engine.seq_len, seq_len)
+            torch_engine = inference.TorchEngine(inference.DEFAULT_CHECKPOINT, 'cpu')
+            tensor = np.random.default_rng(3).random((27, HEIGHT, WIDTH), dtype=np.float32)
+            np.testing.assert_allclose(engine(tensor), torch_engine(tensor), atol=1e-4)
+            engine.close()
 
 
 class RealSenseTests(unittest.TestCase):

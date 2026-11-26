@@ -1,6 +1,6 @@
 # TrackNetV3 · RealSense D435i 实时羽毛球跟踪
 
-基于 [官方 TrackNetV3](https://github.com/qaz812345/TrackNetV3) 的摄像头推理版本。默认通过 `pyrealsense2` SDK 选择已连接的 D435i，读取 1280×720、30 FPS 的 BGR 彩色流。仍支持普通 USB 摄像头和 RTSP/HTTP 视频流。保留 MIT 许可证和 Git 历史。
+基于 [官方 TrackNetV3](https://github.com/qaz812345/TrackNetV3) 的摄像头推理版本。默认通过 `pyrealsense2` SDK 选择已连接的 D435i，读取 1280×720、30 FPS 的 BGR 彩色流。仍支持普通 USB 摄像头和 RTSP/HTTP 视频流。保留 MIT 许可证和 Git 历史。支持 Windows PC（PyTorch CUDA/CPU）和香橙派 AIpro（Ascend NPU，见文末 [部署到香橙派 AIpro](#部署到香橙派-aiproascend-310b-npu)）。
 
 RealSense 采集参照 [官方 Python 彩色采集示例](https://github.com/realsenseai/librealsense/blob/master/wrappers/python/examples/opencv_viewer_example.py)。本工程仅开启彩色流，输出二维像素坐标；未开启深度和 IMU，不输出三维坐标。D435i 不在时会报错，不会自动切换到笔记本摄像头。
 
@@ -82,8 +82,60 @@ powershell -ExecutionPolicy Bypass -File .\TrackNetV3\run_tracking.ps1 -Width 64
 .\.venv\Scripts\python.exe .\TrackNetV3\test_realtime.py
 ```
 
-测试使用模拟摄像头检查连续帧缓存、坐标缩放、断流释放、CSV 输出和官方权重推理，不代表现场识别精度。真实硬件可用 `--headless --max-results 3` 做有限次数检查。
+测试使用模拟摄像头检查连续帧缓存、坐标缩放、断流释放、CSV 输出和官方权重推理，不代表现场识别精度。另用模拟 pyACL 检查 OM 推理的数据拷贝与资源释放；安装 `onnx`、`onnxruntime` 后还会比对导出的 ONNX 与 PyTorch 输出。真实硬件可用 `--headless --max-results 3` 做有限次数检查。
 
 2026-11-24 已通过 RealSense SDK 识别本机 D435i（USB 3.2），以 1280×720/30 FPS 彩色模式完成背景采集、3 次 RTX 4060 官方模型推理并正常释放退出。SDK 设备选择、帧数据复制、超时及释放行为另有模拟测试。尚未以真实羽毛球场景验证精度。清理掉的旧文件保存在上一级 `.cleanup-backup/realtime-migration.zip`，便于恢复。
 
 相机无法打开时，先关闭 RealSense Viewer 和其他占用相机的软件，确认 USB 连接正常，再用 `-ListDevices` 检查。SDK 已安装在项目 `.venv`，请使用上述启动入口。
+
+## 部署到香橙派 AIpro（Ascend 310B NPU）
+
+板端不安装 PyTorch：PC 上把官方权重导出为 ONNX，板端用 CANN 自带的 ATC 转换为 `.om`，再由 pyACL 在 NPU 上推理。预处理、背景估计、坐标输出与 PC 版相同；采集线程对每帧只缩放一次，减轻 ARM CPU 负担。
+
+| 推理引擎 `--engine` | 运行位置 | 模型文件 |
+| --- | --- | --- |
+| `torch` | PC，CUDA / CPU | `ckpts/TrackNet_best.pt` |
+| `om` | AIpro NPU（pyACL） | `ckpts/TrackNet_best.om` |
+| `onnx` | 任意 CPU（ONNX Runtime，备用，较慢） | `ckpts/TrackNet_best.onnx` |
+
+默认 `auto`：存在 `ckpts/TrackNet_best.om` 且可导入 pyACL 时用 NPU，否则用 PyTorch。也可用 `--model` 指定文件，按扩展名选择引擎。
+
+### 1. PC 端导出 ONNX
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install onnx onnxruntime
+.\.venv\Scripts\python.exe .\TrackNetV3\export_onnx.py
+```
+
+生成 `TrackNetV3/ckpts/TrackNet_best.onnx`：输入 `input [1,27,288,512]` float32（背景 + 8 帧 RGB，0–1），输出仅最新帧热力图 `heatmap [1,1,288,512]`。脚本会用 ONNX Runtime 与 PyTorch 对比输出。`ckpts/` 下的 ONNX/OM 不提交到 Git。
+
+### 2. 板端准备
+
+AIpro 官方 Ubuntu 镜像已预装 CANN（`/usr/local/Ascend/ascend-toolkit`）。在板上：
+
+```bash
+git clone https://github.com/zuil79463-maker/TrackNet.git && cd TrackNet
+# 将 PC 上的 ONNX 拷到板上，例如：
+#   scp TrackNetV3/ckpts/TrackNet_best.onnx HwHiAiUser@<AIpro-IP>:~/TrackNet/TrackNetV3/ckpts/
+bash TrackNetV3/setup_aipro.sh        # 创建 .venv（继承 CANN 的 Python 模块）、安装依赖、USB udev 规则
+bash TrackNetV3/convert_om.sh         # ATC 转换，按 npu-smi 自动识别 soc_version（如 Ascend310B4）
+```
+
+- `.venv` 使用板上默认 `python3` 并带 `--system-site-packages`，以保证 pyACL 可用；不要求 Python 3.12。
+- 若 `pip install pyrealsense2` 没有对应 aarch64 轮子，运行 `bash TrackNetV3/install_librealsense.sh` 以 RSUSB 后端源码编译（约 30–60 分钟；4 GB 内存版本建议加 swap 或 `JOBS=2`）。
+- 芯片识别失败时手动指定：`SOC_VERSION=Ascend310B4 bash TrackNetV3/convert_om.sh`（以 `npu-smi info` 显示为准）。
+- 板端已装 PyTorch 时也可直接在板上执行 `export_onnx.py`。
+
+### 3. 板端运行
+
+```bash
+bash TrackNetV3/run_tracking.sh --list-devices                 # 检查 D435i
+bash TrackNetV3/run_tracking.sh --headless --max-results 3      # 有限次数自检
+bash TrackNetV3/run_tracking.sh --csv output/d435i.csv          # 连续运行并保存坐标
+bash TrackNetV3/run_tracking.sh --width 848 --height 480        # 降低采集分辨率，减轻 USB 与 CPU 负担
+bash TrackNetV3/run_tracking.sh --engine onnx --threads 4       # 无 OM 模型时的 CPU 备用方案
+```
+
+脚本会 `source /usr/local/Ascend/ascend-toolkit/set_env.sh`（可用 `ASCEND_ENV` 覆盖），其余参数原样传给 `predict.py`。通过 SSH 运行且没有 `DISPLAY` 时自动进入无预览模式；接 HDMI 桌面时显示预览窗口。`Ctrl+C` 或 `SIGTERM`（如 systemd 停止服务）都会释放相机与 NPU。D435i 应接 USB 3.0 口，`--list-devices` 中 USB 显示 `2.x` 时 1280×720@30 可能无法启动。
+
+> 状态：AIpro 适配目前仅完成软件层面验证（PC 上模拟 pyACL 的单元测试与 ONNX/PyTorch 输出比对）。尚未在 AIpro 实机上完成 ATC 转换、NPU 推理和 D435i 采集，实际推理耗时、FP16 精度差异需上板确认。
